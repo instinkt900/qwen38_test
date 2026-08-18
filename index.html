@@ -82,7 +82,8 @@ const deg2rad = d => d * Math.PI / 180;
 function rand(a, b) { return a + Math.random() * (b - a); }
 function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
 function dist2(x1, y1, x2, y2) { const dx = x1 - x2, dy = y1 - y2; return dx * dx + dy * dy; }
-function gauss() { let s = 0; for (let i = 0; i < 4; i++) s += Math.random(); return (s - 2) / 2 * 2; }
+// sum of 4 uniforms minus 2: bell-ish noise in [-2, 2]
+function jitter() { let s = 0; for (let i = 0; i < 4; i++) s += Math.random(); return s - 2; }
 
 // ---------------------------------------------------------------------
 // audio (WebAudio synthesis, no assets)
@@ -288,6 +289,8 @@ const Game = {
   winner: -1,
   difficulty: 'normal',
   passGate: -1,                 // >=0: waiting for "pass keyboard" Enter on that tank
+  turnLost: false,              // current tank died on its own turn; pass without advancing
+  paused: false,
   aiTimer: 0, postShotTimer: 0,
   msg: '', msgTimer: 0,
 
@@ -310,6 +313,7 @@ const Game = {
     this.turnCount = 0; this.dayT = 0.25; this.winner = -1;
     this.passGate = -1; this.postShotTimer = 0; this.projectile = null;
     this.aiTimer = 0; this.shake = 0;
+    this.turnLost = false; this.paused = false;
 
     terrain.generate(randInt(1, 1e9));
 
@@ -364,10 +368,11 @@ const Game = {
 
   endTurn() {
     if (this.state !== 'playing') return;
+    if (this.order.length < 2) { this.finishGame(); return; }
     let guard = 0;
     do { this.curIdx = (this.curIdx + 1) % this.order.length; }
-    while (!this.tanks[this.order[this.curIdx]].alive && guard++ < 16);
-    if (guard >= 16) { this.finishGame(); return; }
+    while (!this.tanks[this.order[this.curIdx]].alive && guard++ < this.order.length);
+    if (guard >= this.order.length) { this.finishGame(); return; }
     this.rollWind();
     this.beginTurn();
   },
@@ -388,7 +393,7 @@ const Game = {
     if (!t.alive) return;
     t.alive = false; t.hp = 0;
     const cur = this.curTank();
-    const oi = this.order.indexOf(this.tanks.indexOf(t));
+    const oi = this.order.indexOf(t.id);
     if (oi >= 0) this.order.splice(oi, 1);
     if (this.curIdx >= this.order.length) this.curIdx = 0;
     this.mines = this.mines.filter(m => m.owner !== t.id);
@@ -411,7 +416,7 @@ const Game = {
   canUseShell(t, idx) {
     const s = SHELLS[idx], st = this.shellStock[t.id];
     if (s.name === 'SMART') return st.smart > 0;
-    if (s.name === 'PARA') return st.para > 0 && this.tanks.length < 8;
+    if (s.name === 'PARA') return st.para > 0 && this.tanks.filter(x => x.alive).length < 8;
     if (s.name === 'SATELLITE') return st.satellite > 0;
     if (s.name === 'MINE') return st.mine > 0;
     return true;
@@ -456,7 +461,9 @@ const Game = {
       AudioSys.para();
     } else if (p.shell === SHELL_IDX.SATELLITE) {
       this.spotOwner = p.owner;
-      this.spotTurnsLeft = Math.max(1, this.tanks.filter(t => t.alive).length);
+      // decremented in beginTurn, starting with the turn after this one: each
+      // of the other tanks gets one spotted turn
+      this.spotTurnsLeft = Math.max(1, this.tanks.filter(t => t.alive).length - 1);
       this.explode(px, py, s.rad, s.dmg, p.owner, 'sat');
       this.setMsg('ENEMIES SPOTTED FOR ' + this.spotTurnsLeft + ' TURN' + (this.spotTurnsLeft > 1 ? 'S' : ''), 2.5);
     } else if (p.shell === SHELL_IDX.MINE) {
@@ -662,8 +669,11 @@ const Game = {
             this.explode(t.x, t.y - 4, 20, 20, -1, 'death');
             this.removeTank(t);
             if (this.state === 'playing' && !this.projectile && this.postShotTimer <= 0 && this.turnLost) {
+              // dead tank was already spliced out of order, so curIdx already
+              // points at the next tank: pass without advancing again
               this.turnLost = false;
-              this.endTurn();
+              this.rollWind();
+              this.beginTurn();
             }
           }
           break;
@@ -717,12 +727,11 @@ const Game = {
       if (this.postShotTimer <= 0 && this.projectile === null && this.state === 'playing') {
         const ct = this.curTank();
         if (!ct || !ct.alive) { this.finishGame(); return; }
-        if (this.turnLost) { this.turnLost = false; this.beginTurn(); }
+        if (this.turnLost) { this.turnLost = false; this.rollWind(); this.beginTurn(); }
         else this.endTurn();
       }
     }
   },
-//__AI__
 };
 // ---------------------------------------------------------------------
 // AI
@@ -815,17 +824,17 @@ function planAI(t) {
     // a valid (if inaccurate) arc exists: home from it
     shell = SHELL_IDX.SMART;
     const n = skill.noise;
-    bestAng = clamp(bestAng + gauss() * 10 * n, 2, 178);
-    bestPow = clamp(bestPow + gauss() * 10 * n, 5, 100);
+    bestAng = clamp(bestAng + jitter() * 10 * n, 2, 178);
+    bestPow = clamp(bestPow + jitter() * 10 * n, 5, 100);
   } else if (bestMiss < 15 && Math.random() < 0.2) {
     shell = SHELL_IDX['BIG GUN'];
     const n = skill.noise;
-    bestAng = clamp(bestAng + gauss() * 20 * n, 2, 178);
-    bestPow = clamp(bestPow + gauss() * 24 * n, 5, 100);
+    bestAng = clamp(bestAng + jitter() * 20 * n, 2, 178);
+    bestPow = clamp(bestPow + jitter() * 24 * n, 5, 100);
   } else {
     const n = skill.noise;
-    bestAng = clamp(bestAng + gauss() * 20 * n, 2, 178);
-    bestPow = clamp(bestPow + gauss() * 24 * n, 5, 100);
+    bestAng = clamp(bestAng + jitter() * 20 * n, 2, 178);
+    bestPow = clamp(bestPow + jitter() * 24 * n, 5, 100);
   }
   t.ai = { move, angle: bestAng, power: Math.round(bestPow), shell, timer: 1, y0: t.y };
 }
@@ -845,8 +854,8 @@ function refineAim(t, skill) {
       if (s < bScore) { bScore = s; bAng = a; bPow = pw; }
     }
   const n = skill.noise;
-  t.ai.angle = clamp(bAng + gauss() * 20 * n, 2, 178);
-  t.ai.power = Math.round(clamp(bPow + gauss() * 24 * n, 5, 100));
+  t.ai.angle = clamp(bAng + jitter() * 20 * n, 2, 178);
+  t.ai.power = Math.round(clamp(bPow + jitter() * 24 * n, 5, 100));
 }
 
 // ---------------------------------------------------------------------
